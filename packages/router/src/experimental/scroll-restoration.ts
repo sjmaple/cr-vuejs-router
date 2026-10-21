@@ -12,6 +12,7 @@ import {
   onDeactivated,
   onScopeDispose,
   toValue,
+  useId,
 } from 'vue'
 import { diagnostics } from '../diagnostics'
 import { START_LOCATION_NORMALIZED } from '../location'
@@ -97,6 +98,23 @@ export interface ScrollRestorationPluginOptions extends UseScrollRestorationOpti
    * @defaultValue `vue:scroll:`
    */
   storageKeyPrefix?: string
+
+  /**
+   * Registers capture triggers when the plugin is installed.
+   * Replaces all default triggers, including capture after navigation.
+   *
+   * `capture(route?)` saves all active registrations for the supplied route,
+   * which defaults to the current route. Use `signal`
+   * to remove listeners or cancel pending work when the app is unmounted.
+   * A function that registers no listeners allows manual capture.
+   *
+   * @defaultValue {@link SCROLL_RESTORATION_SETUP_LISTENERS_DEFAULT}
+   */
+  setupListeners?: (
+    capture: (route?: RouteLocationNormalized) => void,
+    signal: AbortSignal,
+    router: EXPERIMENTAL_Router | Router
+  ) => void
 
   capture: NonNullable<UseScrollRestorationOptions['capture']>
   restore: NonNullable<UseScrollRestorationOptions['restore']>
@@ -249,6 +267,32 @@ export function SCROLL_RESTORATION_RESTORE_DEFAULT(
 }
 
 /**
+ * Captures after successful navigation, on pagehide, and when the document becomes hidden.
+ * The signal removes all listeners when the app is unmounted.
+ *
+ * @see {@link ScrollRestorationPluginOptions.setupListeners}
+ */
+export function SCROLL_RESTORATION_SETUP_LISTENERS_DEFAULT(
+  capture: (route?: RouteLocationNormalized) => void,
+  signal: AbortSignal,
+  router: EXPERIMENTAL_Router | Router
+): void {
+  // The DOM still shows `from` until the next render flush.
+  const removeAfterEach = router.afterEach((_to, from, failure) => {
+    if (!failure && from !== START_LOCATION_NORMALIZED) capture(from)
+  })
+  signal.addEventListener('abort', removeAfterEach, { once: true })
+  window.addEventListener('pagehide', () => capture(), { signal })
+  document.addEventListener(
+    'visibilitychange',
+    () => {
+      if (document.visibilityState === 'hidden') capture()
+    },
+    { signal }
+  )
+}
+
+/**
  * @internal
  */
 type ScrollRestorationRegistration = Required<UseScrollRestorationOptions>
@@ -257,7 +301,8 @@ const SCROLL_RESTORATION_REGISTRATIONS: InjectionKey<
   [
     registrations: Map<
       ScrollRestorationRegistration,
-      ComponentInternalInstance
+      // vapor doesn't support getCurrentInstance()
+      ComponentInternalInstance | string
     >,
     restore: (
       registration: ScrollRestorationRegistration,
@@ -285,6 +330,7 @@ const SCROLL_RESTORATION_PLUGIN_OPTIONS_DEFAULTS: Required<
   // restore: SCROLL_RESTORATION_RESTORE_DEFAULT,
   key: to => to.path + to.hash,
   manual: false,
+  setupListeners: SCROLL_RESTORATION_SETUP_LISTENERS_DEFAULT,
 }
 
 const SCROLL_RESTORATION_OPTIONS_KEY: InjectionKey<
@@ -376,7 +422,7 @@ function ScrollRestorationClient(
     isActive,
   ])
 
-  function capture(route: RouteLocationNormalized) {
+  function capture(route: RouteLocationNormalized = router.currentRoute.value) {
     // track for dev warnings
     if (__DEV__) {
       devTrackedCapturedOptions = new Map()
@@ -407,29 +453,14 @@ function ScrollRestorationClient(
     }
   }
 
-  // TODO: is this the right way? capturing on unmount within the composable seems safer
-  // the DOM still shows `from` until the next render flush
-  const removeAfterEach = router.afterEach((_to, from, failure) => {
-    if (!failure && from !== START_LOCATION_NORMALIZED) capture(from)
-  })
   const listenersController = new AbortController()
-  const captureOnPageHide = () => capture(router.currentRoute.value)
-  // a hidden page can be killed without pagehide
-  window.addEventListener('pagehide', captureOnPageHide, {
-    signal: listenersController.signal,
-  })
-  document.addEventListener(
-    'visibilitychange',
-    () => {
-      if (document.visibilityState === 'hidden') captureOnPageHide()
-    },
-    {
-      signal: listenersController.signal,
-    }
+  optionsWithDefaults.setupListeners(
+    capture,
+    listenersController.signal,
+    router
   )
 
   app.onUnmount(() => {
-    removeAfterEach()
     listenersController.abort()
   })
 }
@@ -473,9 +504,11 @@ function useScrollRestorationClient<
   const [registrations, restore, isActive] = inject(
     SCROLL_RESTORATION_REGISTRATIONS
   )!
-  const globalOptions = inject(SCROLL_RESTORATION_OPTIONS_KEY)!
-  const optionsWithDefaults = { ...globalOptions, ...options }
-  const instance = getCurrentInstance()!
+  const optionsWithDefaults = {
+    ...inject(SCROLL_RESTORATION_OPTIONS_KEY)!,
+    ...options,
+  }
+  const instance = getCurrentInstance() || useId()
 
   const add = () => registrations.set(optionsWithDefaults, instance)
   const remove = () => registrations.delete(optionsWithDefaults)
