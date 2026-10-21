@@ -134,6 +134,42 @@ definePage({
 })
 ```
 
+## Passing params as props
+
+Use `props` in `definePage()` to pass props to the page component. It applies only to the view of the page component. For example, `props` in `index@sidebar.vue` applies to the `sidebar` view:
+
+```vue
+<!-- src/pages/users/[userId=int].vue -->
+<script setup lang="ts">
+defineProps<{ userId: number; page: number }>()
+
+definePage({
+  params: {
+    query: { page: { parser: 'int', default: 1 } },
+  },
+  // pass route.params (path, query, and hash params) as props
+  props: true,
+})
+</script>
+```
+
+`props` accepts these values:
+
+- `true`: pass `route.params` as props **and automatically types `defineProps()`**. This includes the query and hash params.
+- `false`: pass no props, same as not declaring `props`.
+- An object: pass these static props.
+- A function: receives the route location and returns the props.
+
+```ts
+definePage({
+  props: to => ({ userId: to.params.userId, page: to.params.page + 1 }),
+})
+```
+
+With the `sfc-typed-router` Volar plugin, TypeScript checks `props` against the params of the route and against the props of the page component. In the example above, `props: true` gives an error if the component declares a required prop that the params do not supply, or if the types do not match (e.g. `userId: string` with the `int` parser).
+
+With `props: true`, the plugin also adds the params of the route to the type of `defineProps()`, so `defineProps<{ extra?: string }>()` is typed as `defineProps<RouteParams & { extra?: string }>()`. At build time, the Vite plugin also declares the params in `defineProps()`, so Vue passes them as props instead of attrs. Runtime declarations like `defineProps(['extra'])` are left untouched: list the params there yourself.
+
 ## With Data Loaders
 
 If you use [Data Loaders](../data-loaders/), install the plugin **before** the router:

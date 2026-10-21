@@ -31,6 +31,11 @@ const MACRO_DEFINE_PAGE = 'definePage'
 export const MACRO_DEFINE_PAGE_QUERY = /[?&]definePage\b/
 
 /**
+ * `definePage()` properties read at build time by {@link extractDefinePageInfo}.
+ */
+const STATIC_PROPERTIES = new Set(['name', 'path', 'alias', 'params'])
+
+/**
  * Generate the ast from a code string and an id. Works with SFC and non-SFC files.
  */
 function getCodeAst(code: string, id: string) {
@@ -86,9 +91,15 @@ function getNodeSource(
 export function definePageTransform({
   code,
   id,
+  getRoutePropNames,
 }: {
   code: string
   id: string
+  /**
+   * Returns the names of the params passed as props to the page file
+   * `filePath` by `definePage({ props: true })`.
+   */
+  getRoutePropNames?: (filePath: string) => string[]
 }): Thenable<TransformResult> {
   // are we extracting only the definePage object
   const isExtractingDefinePage = MACRO_DEFINE_PAGE_QUERY.test(id)
@@ -147,8 +158,6 @@ export function definePageTransform({
 
     const scriptBindings = ast.body ? getIdentifiers(ast.body) : []
 
-    // TODO: remove information that was extracted already like name, path, params
-
     // this will throw if a property from the script setup is used in definePage
     try {
       checkInvalidScopeReference(routeRecord, MACRO_DEFINE_PAGE, scriptBindings)
@@ -167,6 +176,32 @@ export function definePageTransform({
     s.remove(0, offset + routeRecord.start!)
     s.prepend(`export default `)
 
+    // extracted at build time (or invalid), so only dead weight in the bundle
+    const strippedProps = new Set<Node>()
+    if (routeRecord.type === 'ObjectExpression') {
+      const props = routeRecord.properties
+      props.forEach((prop, i) => {
+        if (
+          prop.type === 'ObjectProperty' &&
+          !prop.computed &&
+          STATIC_PROPERTIES.has(
+            prop.key.type === 'Identifier'
+              ? prop.key.name
+              : prop.key.type === 'StringLiteral'
+                ? prop.key.value
+                : ''
+          )
+        ) {
+          strippedProps.add(prop)
+          // up to the next property or `}` to also remove the comma
+          s.remove(
+            offset + prop.start!,
+            offset + (props[i + 1]?.start ?? routeRecord.end! - 1)
+          )
+        }
+      })
+    }
+
     // find all static imports and filter out the ones that are not used
     const staticImports = findStaticImports(code)
 
@@ -175,8 +210,10 @@ export function definePageTransform({
 
     walkAST(routeRecord, {
       enter(node) {
-        // skip literal keys from object properties
-        if (
+        if (strippedProps.has(node)) {
+          this.skip()
+          // skip literal keys from object properties
+        } else if (
           this.parent?.type === 'ObjectProperty' &&
           this.parent.key === node &&
           // still track computed keys [a + b]: 1
@@ -237,8 +274,77 @@ export function definePageTransform({
       s.remove(offset + node.start!, offset + node.end!)
     }
 
+    if (getRoutePropNames && hasPropsTrue(definePageNode)) {
+      const propNames = getRoutePropNames(id)
+      if (propNames.length) {
+        declareRouteProps(s, ast, offset, propNames)
+      }
+    }
+
     return generateTransform(s, id)
   }
+}
+
+/**
+ * Checks if a `definePage()` call has `props: true`.
+ */
+function hasPropsTrue(definePageNode: CallExpression): boolean {
+  const routeRecord = definePageNode.arguments[0]
+  return (
+    routeRecord?.type === 'ObjectExpression' &&
+    routeRecord.properties.some(
+      prop =>
+        prop.type === 'ObjectProperty' &&
+        !prop.computed &&
+        ((prop.key.type === 'Identifier' && prop.key.name === 'props') ||
+          (prop.key.type === 'StringLiteral' && prop.key.value === 'props')) &&
+        prop.value.type === 'BooleanLiteral' &&
+        prop.value.value
+    )
+  )
+}
+
+/**
+ * Declares the route params passed by `definePage({ props: true })` in
+ * `defineProps()` before Vue compiles the SFC. Without this, Vue would pass
+ * the params as attrs because the injected types only exist for TypeScript.
+ * Runtime declarations like `defineProps(['a'])` are left untouched.
+ *
+ * @param s - MagicString of the SFC
+ * @param ast - ast of the script setup
+ * @param offset - offset of the script setup in the SFC
+ * @param propNames - names of the params passed as props
+ */
+function declareRouteProps(
+  s: MagicString,
+  ast: Program,
+  offset: number,
+  propNames: string[]
+) {
+  walkAST(ast, {
+    enter(node) {
+      if (!isCallOf(node, 'defineProps') || node.arguments.length) return
+      this.skip()
+
+      // babel 7 uses `typeParameters`
+      const typeArg = (
+        node.typeArguments ??
+        (node as { typeParameters?: typeof node.typeArguments }).typeParameters
+      )?.params[0]
+      if (typeArg) {
+        // `?:` keeps the optionality and runtime types of the props declared
+        // by the user. Vue ignores `any` in intersections
+        s.prependLeft(
+          offset + typeArg.start!,
+          `{ ${propNames.map(name => `${JSON.stringify(name)}?: any`).join('; ')} } & (`
+        )
+        s.appendRight(offset + typeArg.end!, `)`)
+      } else {
+        // right before the closing parenthesis
+        s.appendLeft(offset + node.end! - 1, JSON.stringify(propNames))
+      }
+    },
+  })
 }
 
 type DefinePageParamsInfo = NonNullable<CustomRouteBlock['params']>

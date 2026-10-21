@@ -4,6 +4,7 @@ import { definePageTransform, extractDefinePageInfo } from './definePage'
 import { ts } from '../utils'
 import { TreeNodeValueStatic, isTreeParamOptional } from './treeNodeValue'
 import { mockWarn } from '../../tests/vitest-mock-warn'
+import { compileScript, parse } from '@vue/compiler-sfc'
 
 const vue = String.raw
 
@@ -172,7 +173,7 @@ definePage({
     const a = 1
     definePage({
       name: 'custom',
-      path: '/custom',
+      meta: { a: 1 },
     })
     const b = 1
     `,
@@ -183,6 +184,53 @@ definePage({
     expect(result).toBeDefined()
     expect(result).toHaveProperty('code')
     expect(result?.code).toMatchSnapshot()
+  })
+
+  describe('properties extracted at build time', () => {
+    async function extract(definePageCode: string) {
+      const result = (await definePageTransform({
+        code: vue`
+<script setup>
+import { a, b } from './lib'
+${definePageCode}
+</script>
+`,
+        id: 'src/pages/basic.vue?definePage&vue',
+      })) as Exclude<TransformResult, string>
+      return result.code
+    }
+
+    it('removes name, path, alias, and params', async () => {
+      expect(
+        await extract(`definePage({
+  name: 'custom',
+  meta: { a: 1 },
+  path: '/custom',
+  'alias': ['/other'],
+  redirect: '/',
+  params: { query: { page: 'int' } },
+})`)
+      ).toMatchInlineSnapshot(`
+        "export default {
+          meta: { a: 1 },
+          redirect: '/',
+          }"
+      `)
+    })
+
+    it('removes invalid name and path and their unused imports', async () => {
+      expect(
+        await extract(`definePage({ name: a, path: b, meta: { a: 1 } })`)
+      ).toMatchInlineSnapshot(`"export default { meta: { a: 1 } }"`)
+    })
+
+    it('keeps imports used by other properties', async () => {
+      expect(await extract(`definePage({ alias: [a], meta: { b } })`))
+        .toMatchInlineSnapshot(`
+        "import {b} from './lib'
+        export default { meta: { b } }"
+      `)
+    })
   })
 
   it('handles definePage using a variable from setup gracefully', async () => {
@@ -206,6 +254,104 @@ definePage({
     ).toHaveBeenWarned()
   })
 
+  describe('route props with `props: true`', () => {
+    const getRoutePropNames = () => ['userId', 'page']
+
+    async function transformScript(script: string, lang = 'ts') {
+      const result = (await definePageTransform({
+        code: `<script setup lang="${lang}">\n${script}\n</script>\n`,
+        id: 'src/pages/users/[userId].vue',
+        getRoutePropNames,
+      })) as Exclude<TransformResult, string> | undefined
+      return result?.code
+    }
+
+    /** Runtime props declared by Vue for the transformed SFC */
+    async function compileProps(script: string, lang = 'ts') {
+      const code = await transformScript(script, lang)
+      const { descriptor } = parse(code!, { filename: 'page.vue' })
+      const { content } = compileScript(descriptor, { id: 'page' })
+      return content.slice(
+        content.indexOf('props: '),
+        content.indexOf('setup(')
+      )
+    }
+
+    it('declares the params in `defineProps()`', async () => {
+      expect(
+        await transformScript(`const props = defineProps()
+definePage({ props: true })`)
+      ).toContain(`const props = defineProps(["userId","page"])`)
+    })
+
+    it.each(["'props'", '"props"'])(
+      'declares the params with a %s key',
+      async key => {
+        expect(
+          await transformScript(`defineProps()
+definePage({ ${key}: true })`)
+        ).toContain(`defineProps(["userId","page"])`)
+      }
+    )
+
+    it('ignores a computed props key', async () => {
+      expect(
+        await transformScript(`defineProps()
+definePage({ ['props']: true })`)
+      ).toContain('defineProps()')
+    })
+
+    it('adds the params to the type argument of `defineProps()`', async () => {
+      expect(
+        await transformScript(`const props = withDefaults(defineProps<Props & { extra?: string }>(), {})
+definePage({ props: true })`)
+      ).toContain(
+        `const props = withDefaults(defineProps<{ "userId"?: any; "page"?: any } & (Props & { extra?: string })>(), {})`
+      )
+    })
+
+    it('makes Vue declare the params at runtime', async () => {
+      const props = await compileProps(`defineProps()
+definePage({ props: true })`)
+      expect(props).toContain('"userId"')
+      expect(props).toContain('"page"')
+    })
+
+    it('keeps the runtime types of props declared by the user', async () => {
+      const props =
+        await compileProps(`defineProps<{ page: number; extra: boolean }>()
+definePage({ props: true })`)
+      expect(props).toMatch(/"?userId"?: \{ type: null/)
+      expect(props).toMatch(/"?page"?: \{ type: Number/)
+      expect(props).toMatch(/"?extra"?: \{ type: Boolean, required: true/)
+    })
+
+    it('works in a js script', async () => {
+      const props = await compileProps(
+        `defineProps()
+definePage({ props: true })`,
+        'js'
+      )
+      expect(props).toContain('"userId"')
+    })
+
+    it('does nothing without `props: true`', async () => {
+      for (const props of ['false', 'to => to.params', '{}']) {
+        expect(
+          await transformScript(`defineProps()
+definePage({ props: ${props} })`)
+        ).toContain(`defineProps()`)
+      }
+    })
+
+    it('leaves runtime props declarations untouched', async () => {
+      expect(
+        await transformScript(`defineProps(['other'])
+definePage({ props: true })`)
+      ).toContain(`defineProps(['other'])`)
+    })
+  })
+
   describe('duplicate definePage()', () => {
     const duplicateCode = vue`
 <script setup>
@@ -220,7 +366,12 @@ definePage({
 
     it('does not throw and keeps the first call when extracting', async () => {
       const result = (await definePageTransform({
-        code: duplicateCode,
+        code: vue`
+<script setup>
+definePage({ meta: { first: true } })
+definePage({ meta: { second: true } })
+</script>
+`,
         id: 'src/pages/dup.vue?definePage&vue',
       })) as Exclude<TransformResult, string>
 
@@ -783,9 +934,7 @@ const b = 1
     ).toMatchObject({
       code: ts`
 export default {
-  name: 'custom',
-  path: '/custom',
-}`.trim(),
+  }`.trim(),
     })
 
     expect(

@@ -1,22 +1,36 @@
 // TODO: this file should be splitted into different features  since it's not about runtime anymore
 import type { TypesConfig } from '../config'
-import type { RouteRecordRaw } from '../types'
+import type { RouteParamsGeneric, RouteRecordRaw } from '../types'
+import type {
+  RouteLocationNormalizedLoaded,
+  RouteLocationNormalizedLoadedGeneric,
+  RouteMap,
+} from '../typed-routes'
+import type {
+  EXPERIMENTAL_RouteRecordPropsOption,
+  ComponentProps,
+} from './route-props'
+import { assign } from '../utils'
 
 /**
  * Helper to define page properties with file-based routing.
  * **Doesn't do anything**, used for types only.
  *
- * The `FilePath` type parameter is injected by the `sfc-typed-router` Volar
- * plugin so that `params.path` keys are restricted to the file's actual path
- * params. When omitted, `params.path` falls back to a loose record.
+ * The `FilePath` and `Component` type parameters are injected by the
+ * `sfc-typed-router` Volar plugin. `FilePath` restricts the `params.path`
+ * keys to the path params of the file and types the route location of
+ * `props`. `Component` is the type of the page component and type checks
+ * `props` against its props. It is only injected when `props` is set and not
+ * `false`. When omitted, both fall back to loose types.
  *
  * @param route - route information to be added to this page
  *
  * @internal
  */
-export function definePage<FilePath extends string = string>(
-  route: DefinePage<FilePath>
-): DefinePage<FilePath> {
+export function definePage<
+  FilePath extends string = string,
+  Component = unknown,
+>(route: DefinePage<FilePath, Component>): DefinePage<FilePath, Component> {
   return route
 }
 
@@ -40,6 +54,46 @@ export type PathParamNamesForFilePath<FilePath extends string> =
     : string
 
 /**
+ * Resolves the union of route names that can render a page file: the route
+ * of the file and all its children. Falls back to all the route names when
+ * no entry is augmented.
+ *
+ * @internal
+ */
+export type RouteNamesForFilePath<FilePath extends string> =
+  TypesConfig extends {
+    _RouteFileInfoMap: {
+      [K in FilePath]: { routes: infer N }
+    }
+  }
+    ? Extract<N, keyof RouteMap>
+    : keyof RouteMap
+
+/**
+ * Route location that renders a page file.
+ *
+ * @internal
+ */
+export type RouteLocationForFilePath<FilePath extends string> = [
+  RouteNamesForFilePath<FilePath>,
+] extends [never]
+  ? RouteLocationNormalizedLoadedGeneric
+  : RouteLocationNormalizedLoaded<RouteNamesForFilePath<FilePath>>
+
+/**
+ * Props that `definePage({ props: true })` passes to a page component: the
+ * params of the routes that render the page file. The `sfc-typed-router`
+ * Volar plugin injects it into `defineProps()`.
+ *
+ * @internal
+ */
+export type RoutePropsForFilePath<FilePath extends string> = [
+  RouteNamesForFilePath<FilePath>,
+] extends [never]
+  ? RouteParamsGeneric
+  : RouteMap[RouteNamesForFilePath<FilePath>]['params']
+
+/**
  * Merges route records.
  *
  * @internal
@@ -48,26 +102,56 @@ export type PathParamNamesForFilePath<FilePath extends string> =
  * @param routeRecords - route records to merge
  * @returns merged route record
  */
-export function _mergeRouteRecord(
+export function mergeRouteRecord(
   main: RouteRecordRaw,
   ...routeRecords: Partial<RouteRecordRaw>[]
 ): RouteRecordRaw {
   // @ts-expect-error: complicated types
   return routeRecords.reduce((acc, routeRecord) => {
-    const meta = Object.assign({}, acc.meta, routeRecord.meta)
+    const meta = assign({}, acc.meta, routeRecord.meta)
     const alias: string[] = ([] as string[]).concat(
       acc.alias || [],
       routeRecord.alias || []
     )
 
-    // TODO: other nested properties
-    // const props = Object.assign({}, acc.props, routeRecord.props)
+    const props = assign({}, acc.props, routeRecord.props)
 
-    Object.assign(acc, routeRecord)
+    assign(acc, routeRecord)
     acc.meta = meta
     acc.alias = alias
+    acc.props = props
     return acc
   }, main)
+}
+
+/**
+ * Merges the `definePage()` data of each view into a route record of the
+ * experimental router. The `meta` of all pages is merged and the `props` of a
+ * page only apply to its view. Expects `name`, `path`, `alias`, and `params`
+ * to be removed at build time.
+ *
+ * @internal
+ *
+ * @param record - route record generated from the file structure, without `props`
+ * @param pages - `definePage()` data, indexed by view name
+ * @returns the merged route record
+ */
+export function mergeRouteRecordViews<TRecord extends object>(
+  record: TRecord,
+  pages: Record<string, DefinePage>
+): TRecord {
+  const r = record as { meta?: object; props?: Record<string, unknown> }
+  const meta = assign({}, r.meta)
+  const props: Record<string, unknown> = {}
+  for (const view in pages) {
+    const page = pages[view]!
+    assign(r, page)
+    assign(meta, page.meta)
+    props[view] = page.props
+  }
+  r.meta = meta
+  r.props = props
+  return record
 }
 
 /**
@@ -76,10 +160,35 @@ export function _mergeRouteRecord(
  * @typeParam FilePath - File path of the SFC declaring this page, used to
  * narrow `params.path` keys to the actual path parameters of the route. When
  * left as the default `string`, keys are unrestricted.
+ * @typeParam Component - Type of the page component, used to type check
+ * `props`. When left as the default `unknown`, any props are accepted.
  */
-export interface DefinePage<FilePath extends string = string> extends Partial<
-  Omit<RouteRecordRaw, 'children' | 'components' | 'component' | 'name'>
+export interface DefinePage<
+  FilePath extends string = string,
+  Component = unknown,
+> extends Partial<
+  Omit<
+    RouteRecordRaw,
+    'children' | 'components' | 'component' | 'name' | 'props'
+  >
 > {
+  /**
+   * Pass props to the page component. It only applies to the view of the
+   * page component, e.g. `sidebar` for `index@sidebar.vue`.
+   *
+   * - `true`: pass `route.params` (including query and hash params) as props.
+   * - `false`: pass no props.
+   * - object: pass these static props.
+   * - function: receives the route location and returns the props.
+   *
+   * With the `sfc-typed-router` Volar plugin, the props are type checked
+   * against the params of the route and the props of the page component.
+   */
+  props?: EXPERIMENTAL_RouteRecordPropsOption<
+    RouteLocationForFilePath<FilePath>,
+    ComponentProps<Component>
+  >
+
   /**
    * Override the route name. If not provided, the name will be generated based
    * on the file path. Can be set to `false` to make the route _anonymous_
